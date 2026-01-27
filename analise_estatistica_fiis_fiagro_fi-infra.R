@@ -7,10 +7,14 @@ library(dplyr)
 # 2. Definir os tickers e o período
 tickers <- c("HGBS11.SA", "XPML11.SA", "VISC11.SA", "IFIX.SA") 
 
+# Coleta e Limpeza 
 dados_fii <- tq_get(tickers,
                     from = "2023-01-01",
                     to = Sys.Date(),
                     get = "stock.prices")
+
+dados_limpos <- tq_get(tickers, from = "2023-01-01", to = "2025-12-01") %>%
+  filter(!is.na(adjusted) & adjusted > 0) # Remove erros de base de dados
 
 # Calcular Retorno Acumulado 
 retornos_acumulados <- dados_fii %>%
@@ -41,10 +45,6 @@ ggplot(retornos_acumulados, aes(x = date, y = retorno_acum, color = symbol)) +
        x = "Data", y = "Retorno Acumulado") +
   theme_minimal()
 
-# Coleta e Limpeza 
-dados_limpos <- tq_get(tickers, from = "2023-01-01", to = "2025-12-01") %>%
-  filter(!is.na(adjusted) & adjusted > 0) # Remove erros de base de dados
-
 # Cálculo de Métricas Estatísticas (Sharpe e Volatilidade)
 metricas <- dados_limpos %>%
   group_by(symbol) %>%
@@ -65,4 +65,5 @@ ggplot(metricas, aes(x = Volatilidade_Anual, y = Retorno_Anual, label = symbol))
        x = "Risco (Volatilidade Anualizada)",
        y = "Retorno Esperado (Anualizado)",
        size = "Índice de Sharpe") +
+
   theme_minimal()
