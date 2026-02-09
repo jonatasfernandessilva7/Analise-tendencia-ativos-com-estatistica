@@ -1,69 +1,111 @@
-# 1. Instalar e carregar pacotes
-if(!require(tidyquant)) install.packages("tidyquant")
-library(tidyquant)
-library(ggplot2)
-library(dplyr)
+# ==============================================================================
+# AUTOR: JÔNATAS FERNANDES SILVA
+# DATA: 09/02/2026
+# LICENÇA: MIT
+# ==============================================================================
 
-# 2. Definir os tickers e o período
-tickers <- c("HGBS11.SA", "XPML11.SA", "VISC11.SA", "IFIX.SA") 
+# 1. Carregar Pacotes
+pacotes <- c("tidyquant", "ggplot2", "dplyr", "forecast", "scales", "purrr", "tidyr")
+if(!all(pacotes %in% installed.packages())) install.packages(pacotes)
+lapply(pacotes, library, character.only = TRUE)
 
-# Coleta e Limpeza 
-dados_fii <- tq_get(tickers,
-                    from = "2023-01-01",
-                    to = Sys.Date(),
-                    get = "stock.prices")
+# 2. Configuração de Ativos
+tickers <- c("HGBS11.SA", "HSML11.SA", "MULT3.SA", "IFIX.SA")
+data_inicio <- "2019-01-01"
+data_fim    <- "2025-12-31"
 
-dados_limpos <- tq_get(tickers, from = "2023-01-01", to = "2025-12-01") %>%
-  filter(!is.na(adjusted) & adjusted > 0) # Remove erros de base de dados
+# 3. Coleta de Dados
+dados_brutos <- tq_get(tickers, from = data_inicio, to = data_fim) %>%
+  filter(!is.na(adjusted) & adjusted > 0)
 
-# Calcular Retorno Acumulado 
-retornos_acumulados <- dados_fii %>%
+# Coleta de dividendos com tratamento de erro
+dividendos <- tryCatch({
+  tq_get(tickers, get = "dividends", from = data_inicio)
+}, error = function(e) { NULL })
+
+# 4. Processamento e Tratamento do Erro de Join
+if (is.null(dividendos) || nrow(dividendos) == 0) {
+  # Se não houver dividendos, cria coluna de valor zero
+  dados_processados <- dados_brutos %>% mutate(value = 0)
+} else {
+  # Se houver, une os dados e preenche dias sem dividendos com 0
+  dados_processados <- dados_brutos %>%
+    left_join(dividendos, by = c("symbol", "date")) %>%
+    mutate(value = coalesce(value, 0))
+}
+
+# 5. Cálculo de Métricas de Performance e Risco
+dados_analise <- dados_processados %>%
   group_by(symbol) %>%
-  tq_transmute(select = adjusted,
-               mutate_fun = periodReturn,
-               period = "daily",
-               type = "log",
-               col_rename = "retorno") %>%
-  mutate(retorno_acum = cumsum(retorno))
+  mutate(
+    ret_log = log(adjusted / lag(adjusted)),
+    # Total Return: Cota + Dividendos Acumulados
+    retorno_total_acum = (adjusted + cumsum(value)) / first(adjusted) - 1,
+    ma50 = SMA(adjusted, n = 50)
+  ) %>%
+  ungroup()
 
-# Visualização de Tendência (Média Móvel)
-ggplot(dados_fii, aes(x = date, y = adjusted, color = symbol)) +
-  geom_line(alpha = 0.5) +
-  geom_ma(ma_fun = SMA, n = 50, linetype = "solid", size = 1) + 
-  facet_wrap(~symbol, scales = "free_y") +
-  labs(title = "Análise de Tendência: Preço vs Média Móvel (50 dias)",
-       subtitle = "Se o preço está acima da linha sólida, a tendência é de alta",
-       x = "Data", y = "Preço Ajustado", color = "Ativo") +
-  theme_minimal()
-
-# Gráfico de Comparação de Performance
-ggplot(retornos_acumulados, aes(x = date, y = retorno_acum, color = symbol)) +
-  geom_line(size = 1) +
-  scale_y_continuous(labels = scales::percent) +
-  labs(title = "Comparativo de Retorno Acumulado",
-       subtitle = "Base 100: Evolução percentual desde o início de 2023",
-       x = "Data", y = "Retorno Acumulado") +
-  theme_minimal()
-
-# Cálculo de Métricas Estatísticas (Sharpe e Volatilidade)
-metricas <- dados_limpos %>%
+tabela_estatistica <- dados_analise %>%
   group_by(symbol) %>%
-  tq_transmute(select = adjusted, mutate_fun = periodReturn, period = "daily", col_rename = "ret") %>%
   summarise(
-    Retorno_Anual = mean(ret) * 252,
-    Volatilidade_Anual = sd(ret) * sqrt(252),
-    Sharpe = Retorno_Anual / Volatilidade_Anual
-  )
+    Retorno_Anual = mean(ret_log, na.rm = TRUE) * 252,
+    Volatilidade  = sd(ret_log, na.rm = TRUE) * sqrt(252),
+    Sharpe        = Retorno_Anual / Volatilidade,
+    # Sortino: Foca apenas na volatilidade negativa
+    Sortino       = Retorno_Anual / (sd(ret_log[ret_log < 0], na.rm = TRUE) * sqrt(252)),
+    # VaR 95%: Pior perda diária esperada com 95% de confiança
+    VaR_95        = quantile(ret_log, 0.05, na.rm = TRUE),
+    Max_Drawdown  = max(1 - (adjusted / cummax(adjusted)))
+  ) %>%
+  arrange(desc(Sharpe))
 
-# Visualização de Risco vs Retorno 
-ggplot(metricas, aes(x = Volatilidade_Anual, y = Retorno_Anual, label = symbol)) +
-  geom_point(aes(size = Sharpe, color = symbol)) +
-  geom_text(vjust = -1) +
-  scale_x_continuous(labels = scales::percent) +
-  scale_y_continuous(labels = scales::percent) +
-  labs(title = "Eficiência dos FIIs: Risco vs Retorno",
-       x = "Risco (Volatilidade Anualizada)",
-       y = "Retorno Esperado (Anualizado)",
-       size = "Índice de Sharpe") +
+# 6. Automação de Previsão ARIMA 
+previsoes_totais <- dados_analise %>%
+  group_split(symbol) %>%
+  map_df(function(df) {
+    # precisa de pelo menos 2 períodos para o ARIMA
+    if(nrow(df) < 30) return(NULL) 
+    
+    ts_ativo <- ts(df$adjusted, frequency = 252)
+    modelo <- auto.arima(ts_ativo)
+    prev <- forecast(modelo, h = 30)
+    
+    data.frame(
+      date = seq(max(df$date) + 1, by = "day", length.out = 30),
+      adjusted = as.numeric(prev$mean),
+      lower_80 = as.numeric(prev$lower[,1]),
+      upper_80 = as.numeric(prev$upper[,1]),
+      symbol = unique(df$symbol)
+    )
+  })
 
+# 7. Visualizações
+
+# Graf 1: Matriz de Eficiência (Sortino vs Volatilidade)
+p1 <- ggplot(tabela_estatistica, aes(x = Volatilidade, y = Retorno_Anual, label = symbol)) +
+  geom_point(aes(size = Sortino, color = symbol)) +
+  geom_text(vjust = -1.5, size = 3) +
+  scale_x_continuous(labels = percent) +
+  scale_y_continuous(labels = percent) +
+  labs(title = "Eficiência de Ativos: Risco vs Retorno",
+       subtitle = "O Índice de Sortino avalia o retorno pela volatilidade negativa",
+       x = "Risco (Volatilidade Anual)", y = "Retorno Esperado (Anual)") +
   theme_minimal()
+
+# Graf 2: Painel de Tendência e Previsão
+p2 <- ggplot() +
+  geom_line(data = dados_analise %>% filter(date > max(date) - 150), 
+            aes(x = date, y = adjusted), color = "grey30") +
+  geom_line(data = previsoes_totais, aes(x = date, y = adjusted), color = "red", size = 1) +
+  geom_ribbon(data = previsoes_totais, aes(x = date, ymin = lower_80, ymax = upper_80), 
+              fill = "red", alpha = 0.1) +
+  facet_wrap(~symbol, scales = "free_y") +
+  labs(title = "Tendência e Projeção (Próximos 30 dias)",
+       subtitle = "Área vermelha: Margem de confiança do modelo",
+       x = NULL, y = "Preço Ajustado (R$)") +
+  theme_bw()
+
+# Resultados
+print(tabela_estatistica)
+print(p1)
+print(p2)
